@@ -9,11 +9,16 @@
 Замените build_demo_db() на подключение к реальному Northwind для работы с реальными данными.
 """
 
+import logging
 import os
 import sqlite3
+import sys
+
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+
+log = logging.getLogger(__name__)
 
 RESULTS_DIR = os.path.join(os.path.dirname(__file__), "..", "results")
 os.makedirs(RESULTS_DIR, exist_ok=True)
@@ -25,6 +30,14 @@ os.makedirs(RESULTS_DIR, exist_ok=True)
 def build_demo_db():
     rng = np.random.default_rng(42)
     con = sqlite3.connect(":memory:")
+    try:
+        return _populate_demo_db(con, rng)
+    except Exception:
+        con.close()
+        raise
+
+
+def _populate_demo_db(con, rng):
     cur = con.cursor()
     cur.executescript(
         """
@@ -72,6 +85,9 @@ def build_demo_db():
     cur.executemany("INSERT INTO Orders VALUES (?,?,?,?)", orders)
     cur.executemany("INSERT INTO OrderDetails VALUES (?,?,?,?)", details)
     con.commit()
+    row_count = cur.execute("SELECT COUNT(*) FROM Orders").fetchone()[0]
+    if row_count == 0:
+        raise RuntimeError("Демо-база пуста после заполнения")
     return con
 
 
@@ -88,6 +104,8 @@ def chart_monthly_trend(con):
         GROUP BY month ORDER BY month;
     """
     df = pd.read_sql(q, con)
+    if df.empty:
+        raise ValueError("Запрос месячного тренда не вернул данных — проверьте целостность данных")
     fig, ax = plt.subplots(figsize=(9, 4.5))
     ax.plot(df["month"], df["revenue"], marker="o", linewidth=2, color="#2563eb")
     ax.fill_between(df["month"], df["revenue"], alpha=0.12, color="#2563eb")
@@ -97,8 +115,12 @@ def chart_monthly_trend(con):
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
     out = os.path.join(RESULTS_DIR, "monthly_trend.png")
-    fig.savefig(out, dpi=130)
-    plt.close(fig)
+    try:
+        fig.savefig(out, dpi=130)
+    except OSError as exc:
+        raise OSError(f"Не удалось сохранить monthly_trend.png: {exc}") from exc
+    finally:
+        plt.close(fig)
     return out
 
 
@@ -112,6 +134,8 @@ def chart_category_revenue(con):
         GROUP BY c.CategoryName ORDER BY revenue DESC;
     """
     df = pd.read_sql(q, con)
+    if df.empty:
+        raise ValueError("Запрос выручки по категориям не вернул данных — проверьте целостность данных")
     avg = df["revenue"].mean()
     colors = ["#2563eb" if v > avg else "#cbd5e1" for v in df["revenue"]]
     fig, ax = plt.subplots(figsize=(9, 4.5))
@@ -124,8 +148,12 @@ def chart_category_revenue(con):
     plt.xticks(rotation=30, ha="right")
     fig.tight_layout()
     out = os.path.join(RESULTS_DIR, "category_revenue.png")
-    fig.savefig(out, dpi=130)
-    plt.close(fig)
+    try:
+        fig.savefig(out, dpi=130)
+    except OSError as exc:
+        raise OSError(f"Не удалось сохранить category_revenue.png: {exc}") from exc
+    finally:
+        plt.close(fig)
     return out
 
 
@@ -140,8 +168,15 @@ def chart_clv_segments(con):
         GROUP BY c.CustomerID, c.CustomerName;
     """
     df = pd.read_sql(q, con)
-    df["segment"] = pd.qcut(df["revenue"], q=[0, 0.5, 0.8, 1.0],
-                            labels=["Low", "Medium", "High"])
+    if df.empty:
+        raise ValueError("Запрос CLV-сегментов не вернул данных — проверьте целостность данных")
+    try:
+        df["segment"] = pd.qcut(df["revenue"], q=[0, 0.5, 0.8, 1.0],
+                                labels=["Low", "Medium", "High"])
+    except ValueError as exc:
+        raise ValueError(
+            f"Невозможно разбить клиентов на квантили (вероятно, слишком мало уникальных значений): {exc}"
+        ) from exc
     counts = df["segment"].value_counts().reindex(["High", "Medium", "Low"])
     fig, ax = plt.subplots(figsize=(7, 4.5))
     ax.bar(counts.index, counts.values, color=["#2563eb", "#60a5fa", "#cbd5e1"])
@@ -151,19 +186,46 @@ def chart_clv_segments(con):
         ax.text(i, v + 0.1, str(int(v)), ha="center")
     fig.tight_layout()
     out = os.path.join(RESULTS_DIR, "clv_segments.png")
-    fig.savefig(out, dpi=130)
-    plt.close(fig)
+    try:
+        fig.savefig(out, dpi=130)
+    except OSError as exc:
+        raise OSError(f"Не удалось сохранить clv_segments.png: {exc}") from exc
+    finally:
+        plt.close(fig)
     return out
 
 
 def main():
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(levelname)s: %(message)s",
+    )
+
     con = build_demo_db()
-    outputs = [chart_monthly_trend(con), chart_category_revenue(con),
-               chart_clv_segments(con)]
-    con.close()
-    print("Графики сохранены:")
-    for o in outputs:
-        print("  -", os.path.relpath(o))
+    chart_funcs = [
+        ("monthly_trend", chart_monthly_trend),
+        ("category_revenue", chart_category_revenue),
+        ("clv_segments", chart_clv_segments),
+    ]
+    outputs = []
+    errors = []
+    try:
+        for name, func in chart_funcs:
+            try:
+                outputs.append(func(con))
+            except Exception:
+                log.exception("График '%s' не удался", name)
+                errors.append(name)
+    finally:
+        con.close()
+
+    if outputs:
+        log.info("Графики сохранены:")
+        for o in outputs:
+            log.info("  - %s", os.path.relpath(o))
+    if errors:
+        log.error("Не удавшиеся графики: %s", ", ".join(errors))
+        sys.exit(1)
 
 
 if __name__ == "__main__":
